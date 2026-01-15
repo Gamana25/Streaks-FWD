@@ -1,13 +1,14 @@
 {
-  "name": "streaks-keep-it-lit",
+  "name": "streaks-fwd",
   "private": true,
   "version": "0.0.0",
   "type": "module",
-  "homepage": "https://hanisha2767.github.io/Streaks",
+  "homepage": "https://gamana25.github.io/Streaks-FWD",
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "deploy": "gh-pages -d dist -r https://github.com/hanisha2767/Streaks.git"
+    "predeploy": "npm run build",
+    "deploy": "gh-pages -d dist"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.90.1",
