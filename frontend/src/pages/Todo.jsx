@@ -100,6 +100,9 @@ function Todo() {
   const [saving, setSaving] = useState(false);
   const blockRefetchRef = useRef(false); // Block refetches during fade-out period
 
+  // Pending IDs set (in-memory only) to hide tasks awaiting backend confirmation
+  const pendingIdsRef = useRef(new Set());
+
   const [newTask, setNewTask] = useState({
     title: "",
     duration: "",
@@ -107,6 +110,15 @@ function Todo() {
     quadrant: 1,
     completed: false,
   });
+
+  const addPendingId = (id) => {
+    if (id === undefined || id === null) return;
+    pendingIdsRef.current.add(String(id));
+  };
+  const removePendingId = (id) => {
+    if (id === undefined || id === null) return;
+    pendingIdsRef.current.delete(String(id));
+  };
 
   /* ================= FETCH TASKS ================= */
   const fetchTasks = async (useCache = true) => {
@@ -171,8 +183,13 @@ function Todo() {
       const normalizedTasks = data.map(normalizeTask);
 
       // CRITICAL: Filter out completed tasks immediately - they should NEVER appear
-      const activeBackendTasks = normalizedTasks.filter(
+      let activeBackendTasks = normalizedTasks.filter(
         (t) => !t.completed && !t.archived
+      );
+
+      // Also filter out tasks that are currently pending (we don't want backend replies to bring them back)
+      activeBackendTasks = activeBackendTasks.filter(
+        (t) => !pendingIdsRef.current.has(String(t.id))
       );
 
       console.log(
@@ -180,7 +197,7 @@ function Todo() {
         normalizedTasks.length,
         "total,",
         activeBackendTasks.length,
-        "active (non-completed)"
+        "active (non-completed, non-pending)"
       );
 
       // Preserve tasks that are currently in "removing" state (fading out)
@@ -188,7 +205,7 @@ function Todo() {
       setTasks((prev) => {
         const removingTasks = prev.filter((t) => t.removing);
 
-        // Start with active backend tasks (NO completed tasks)
+        // Start with active backend tasks (NO completed tasks, NO pending)
         const mergedTasks = [...activeBackendTasks];
 
         // Add back removing tasks (they're fading out, don't replace them)
@@ -204,7 +221,7 @@ function Todo() {
         return mergedTasks;
       });
 
-      // Only save active (non-completed) tasks to cache
+      // Only save active (non-completed, non-pending) tasks to cache
       localStorage.setItem("tasks", JSON.stringify(activeBackendTasks));
       window.dispatchEvent(new Event("tasks-updated"));
       setLoading(false);
@@ -440,7 +457,9 @@ function Todo() {
             fetchTasks,
             saveTaskToBackend,
             deleteTaskFromBackend,
-            blockRefetchRef
+            blockRefetchRef,
+            addPendingId,
+            removePendingId
           )}
           {renderBox(
             2,
@@ -454,7 +473,9 @@ function Todo() {
             fetchTasks,
             saveTaskToBackend,
             deleteTaskFromBackend,
-            blockRefetchRef
+            blockRefetchRef,
+            addPendingId,
+            removePendingId
           )}
           {renderBox(
             3,
@@ -468,7 +489,9 @@ function Todo() {
             fetchTasks,
             saveTaskToBackend,
             deleteTaskFromBackend,
-            blockRefetchRef
+            blockRefetchRef,
+            addPendingId,
+            removePendingId
           )}
           {renderBox(
             4,
@@ -482,7 +505,9 @@ function Todo() {
             fetchTasks,
             saveTaskToBackend,
             deleteTaskFromBackend,
-            blockRefetchRef
+            blockRefetchRef,
+            addPendingId,
+            removePendingId
           )}
         </div>
       )}
@@ -655,7 +680,9 @@ function renderBox(
   fetchTasks,
   saveTaskToBackend,
   deleteTaskFromBackend,
-  blockRefetchRef
+  blockRefetchRef,
+  addPendingId,
+  removePendingId
 ) {
   // Filter by quadrant - visibleTasks already has incomplete tasks filtered
   const filtered = visibleTasks.filter((t) => {
@@ -687,115 +714,97 @@ function renderBox(
     });
   }
 
-  const toggleDone = async (id) => {
-    // Use current state, not fullTasks prop (which might be stale)
+  const toggleDone = (id) => {
     setTasks((prev) => {
       const currentTask = prev.find((t) => t.id === id);
       if (!currentTask) return prev;
 
-      const nowCompleted = !currentTask.completed;
+      // Add to pending set so fetches won't bring it back
+      addPendingId(id);
 
-      if (nowCompleted) {
-        // IMMEDIATE: Start fade-out animation (UI only, no localStorage)
-        const optimisticTask = { ...currentTask, removing: true, completed: true };
+      // 1️⃣ IMMEDIATE UI: mark removing + completed (for fade animation)
+      const optimisticTask = {
+        ...currentTask,
+        completed: true,
+        removing: true,
+      };
 
-        // Block refetches for 5+ seconds
-        if (blockRefetchRef && blockRefetchRef.current !== undefined) {
-          blockRefetchRef.current = true;
+      // 2️⃣ Update focus minutes immediately
+      addFocusMinutes(currentTask.duration);
+      postFocusMinutes(currentTask.duration).catch(() => {});
+      window.dispatchEvent(new Event("focusUpdated"));
+
+      // 3️⃣ Replace task with optimistic version
+      const updatedList = prev.map((t) =>
+        t.id === id ? optimisticTask : t
+      );
+
+      // 4️⃣ Backend sync AFTER animation (NO double timeout)
+      setTimeout(async () => {
+        const saved = await saveTaskToBackend({
+          ...currentTask,
+          completed: true,
+        });
+
+        if (saved) {
+          // Remove task ONCE after animation
+          setTasks((p) => p.filter((t) => t.id !== id));
+          // Backend confirmed — remove pending mark
+          removePendingId(id);
+        } else {
+          // Rollback on failure
+          setTasks((p) =>
+            p.map((t) =>
+              t.id === id ? { ...currentTask, completed: false, removing: false } : t
+            )
+          );
+          removeFocusMinutes(currentTask.duration);
+          decrementFocusMinutes(currentTask.duration).catch(() => {});
+          // Remove pending mark on failure
+          removePendingId(id);
         }
+      }, 300); // animation duration only
 
-        // Update focus minutes immediately in localStorage
-        addFocusMinutes(currentTask.duration);
-        // Persist focus minutes in backend (fire-and-forget, don't wait)
-        postFocusMinutes(currentTask.duration).catch(() => {});
-        window.dispatchEvent(new Event("focusUpdated"));
-
-        // After animation completes, sync with backend
-        setTimeout(async () => {
-          const updatedTask = { ...currentTask, completed: true };
-          const saved = await saveTaskToBackend(updatedTask);
-
-          if (saved) {
-            // After 5 seconds, actually remove it from the list and unblock refetches
-            setTimeout(() => {
-              setTasks((prevTasks) => prevTasks.filter((t) => t.id !== id));
-              if (blockRefetchRef && blockRefetchRef.current !== undefined) {
-                blockRefetchRef.current = false; // Allow refetches again
-              }
-            }, 5000); // 5 seconds delay before removal
-          } else {
-            // Revert on error - restore original state
-            setTasks((prevTasks) =>
-              prevTasks.map((t) => (t.id === id ? { ...currentTask, removing: false } : t))
-            );
-            removeFocusMinutes(currentTask.duration);
-            decrementFocusMinutes(currentTask.duration).catch(() => {});
-            if (blockRefetchRef && blockRefetchRef.current !== undefined) {
-              blockRefetchRef.current = false; // Unblock on error
-            }
-          }
-        }, 250); // Faster animation - 250ms instead of 500ms
-
-        return prev.map((t) => (t.id === id ? optimisticTask : t));
-      } else {
-        // Uncomplete: immediate optimistic update (UI only, no localStorage)
-        removeFocusMinutes(currentTask.duration);
-        decrementFocusMinutes(currentTask.duration).catch(() => {});
-
-        const optimisticTask = { ...currentTask, completed: false, removing: false };
-
-        // Sync with backend in background (don't update localStorage)
-        setTimeout(async () => {
-          const saved = await saveTaskToBackend(optimisticTask);
-          if (saved) {
-            setTasks((prevTasks) => prevTasks.map((t) => (t.id === id ? saved : t)));
-          }
-        }, 100);
-
-        window.dispatchEvent(new Event("focusUpdated"));
-
-        return prev.map((t) => (t.id === id ? optimisticTask : t));
-      }
+      return updatedList;
     });
   };
 
-  const deleteTask = async (id) => {
-    const currentTask = fullTasks.find((t) => t.id === id);
-    if (!currentTask) return;
+  const deleteTask = (id) => {
+    setTasks((prev) => {
+      const task = prev.find((t) => t.id === id);
+      if (!task) return prev;
 
-    // 1. IMMEDIATE: Start fade-out animation (UI only, no localStorage)
-    setTasks((prev) =>
-      prev.map((t) => (t.id === id ? { ...t, removing: true } : t))
-    );
+      // Add to pending set so fetches won't bring it back while we attempt delete
+      addPendingId(id);
 
-    // Block refetches for 5+ seconds
-    if (blockRefetchRef && blockRefetchRef.current !== undefined) {
-      blockRefetchRef.current = true;
-    }
+      // UI: remove instantly
+      const updatedTasks = prev.filter((t) => t.id !== id);
 
-    // 2. After animation, sync with backend and keep faded for 5 more seconds
-    setTimeout(async () => {
-      const success = await deleteTaskFromBackend(id);
-
-      if (success) {
-        // Keep task faded (removing: true) for 5 more seconds
-        // After 5 seconds, actually remove it and unblock refetches
-        setTimeout(() => {
-          setTasks((prev) => prev.filter((t) => t.id !== id));
-          if (blockRefetchRef && blockRefetchRef.current !== undefined) {
-            blockRefetchRef.current = false; // Allow refetches again
-          }
-        }, 5000); // 5 seconds delay before removal
-      } else {
-        // Revert on error - restore task
-        setTasks((prev) =>
-          prev.map((t) => (t.id === id ? { ...currentTask, removing: false } : t))
-        );
-        if (blockRefetchRef && blockRefetchRef.current !== undefined) {
-          blockRefetchRef.current = false; // Unblock on error
+      // Backend delete later
+      deleteTaskFromBackend(id).then((ok) => {
+        if (ok) {
+          // success -> remove pending mark
+          removePendingId(id);
+        } else {
+          // failure -> rollback and remove pending mark
+          setTasks((p) => {
+            // if it doesn't already exist, re-add
+            const exists = p.some((x) => x.id === task.id);
+            return exists ? p : [...p, task];
+          });
+          removePendingId(id);
         }
-      }
-    }, 250); // Wait for fade animation to complete
+      }).catch(() => {
+        // rollback on error
+        setTasks((p) => {
+          const exists = p.some((x) => x.id === task.id);
+          return exists ? p : [...p, task];
+        });
+        removePendingId(id);
+      });
+
+      return updatedTasks;
+    });
   };
 
   const onDragStart = (e, task) => {
