@@ -2128,7 +2128,7 @@ input[type="checkbox"]:checked {
 /* The Task Container */
 .matrix-task {
   position: relative;
-  transition: opacity 0.6s ease, transform 0.6s ease;
+  transition: opacity 0.2s ease, transform 0.2s ease;
   opacity: 1;
 }
 
